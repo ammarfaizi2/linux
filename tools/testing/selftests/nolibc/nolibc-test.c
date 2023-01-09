@@ -12,9 +12,13 @@
  *   $(CC) with default libc                    => NOLIBC* never defined
  */
 #ifndef NOLIBC
+#include <errno.h>
+#include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #ifndef _NOLIBC_STDIO_H
 /* standard libcs need more includes */
 #include <linux/reboot.h>
@@ -28,13 +32,9 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <dirent.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <sched.h>
-#include <signal.h>
-#include <stdarg.h>
-#include <unistd.h>
 #endif
 #endif
 
@@ -442,6 +442,204 @@ int test_getdents64(const char *dir)
 	return ret;
 }
 
+static int test_getpagesize(void)
+{
+	long x = getpagesize();
+	int c;
+
+	if (x < 0)
+		return x;
+
+#if defined(__x86_64__) || defined(__i386__) || defined(__i486__) || defined(__i586__) || defined(__i686__)
+	/*
+	 * x86 family is always 4K page.
+	 */
+	c = (x == 4096);
+#elif defined(__aarch64__)
+	/*
+	 * Linux aarch64 supports three values of page size: 4K, 16K, and 64K
+	 * which are selected at kernel compilation time.
+	 */
+	c = (x == 4096 || x == (16 * 1024) || x == (64 * 1024));
+#else
+	/*
+	 * Assuming other architectures must have at least 4K page.
+	 */
+	c = (x >= 4096);
+#endif
+
+	return !c;
+}
+
+/*
+ * Test fork().
+ * Make sure the exit code can be read from the parent process.
+ */
+static int test_fork_and_exit(int expected_code)
+{
+	int status;
+	int code;
+	pid_t ret;
+	pid_t p;
+
+	p = fork();
+	if (p < 0)
+		return p;
+
+	if (!p)
+		exit(expected_code);
+
+	do {
+		ret = waitpid(p, &status, 0);
+		if (ret < 0)
+			return ret;
+	} while (!WIFEXITED(status));
+
+	code = WEXITSTATUS(status);
+	if (code != expected_code) {
+		printf("test_fork_and_exit(): waitpid(): Invalid exit code: %d; expected = %d\n", code, expected_code);
+		return -1;
+	}
+
+	return 0;
+}
+
+static int test_fork(void)
+{
+	int i;
+
+	for (i = 0; i < 255; i++) {
+		if (test_fork_and_exit(i))
+			return -1;
+	}
+	return 0;
+}
+
+static volatile int g_test_sig;
+
+static void test_signal_handler(int sig)
+{
+	g_test_sig = sig;
+}
+
+static int test_sigaction_sig(int sig)
+{
+	const struct sigaction new = {
+		.sa_handler = test_signal_handler
+	};
+	struct sigaction old;
+	int ret;
+
+	/*
+	 * Set the signal handler.
+	 */
+	ret = sigaction(sig, &new, &old);
+	if (ret) {
+		printf(" (failed to set handler for signal %d)", sig);
+		return ret;
+	}
+
+	/*
+	 * Test the signal handler.
+	 */
+	g_test_sig = 0;
+	kill(getpid(), sig);
+
+	/*
+	 * test_signal_handler() must set @g_test_sig to @sig.
+	 */
+	if (g_test_sig != sig) {
+		printf(" (invalid g_test_sig value (%d != %d))", sig, g_test_sig);
+		return -1;
+	}
+
+	/*
+	 * Restore the original signal handler.
+	 */
+	ret = sigaction(sig, &old, NULL);
+	if (ret) {
+		printf(" (Failed to restore handler for signal %d)", sig);
+		return ret;
+	}
+
+	return 0;
+}
+
+static int test_signal_sig(int sig)
+{
+	sighandler_t old;
+
+	/*
+	 * Set the signal handler.
+	 */
+	old = signal(sig, test_signal_handler);
+	if (old == SIG_ERR) {
+		printf(" (failed to set handler for signal %d)", sig);
+		return -1;
+	}
+
+	/*
+	 * Test the signal handler.
+	 */
+	g_test_sig = 0;
+	kill(getpid(), sig);
+
+	/*
+	 * test_signal_handler() must set @g_test_sig to @sig.
+	 */
+	if (g_test_sig != sig) {
+		printf(" (invalid g_test_sig value (%d != %d))", sig, g_test_sig);
+		return -1;
+	}
+
+	/*
+	 * Restore the original signal handler.
+	 */
+	old = signal(sig, old);
+	if (old == SIG_ERR) {
+		printf(" (Failed to restore handler for signal %d)", sig);
+		return -1;
+	}
+
+	return 0;
+}
+
+static const int g_sig_to_test[] = {
+	SIGINT,
+	SIGHUP,
+	SIGTERM,
+	SIGQUIT,
+	SIGSEGV
+};
+
+static int test_sigaction(void)
+{
+	size_t i;
+	int ret;
+
+	for (i = 0; i < (sizeof(g_sig_to_test) / sizeof(g_sig_to_test[0])); i++) {
+		ret = test_sigaction_sig(g_sig_to_test[i]);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int test_signal(void)
+{
+	size_t i;
+	int ret;
+
+	for (i = 0; i < (sizeof(g_sig_to_test) / sizeof(g_sig_to_test[0])); i++) {
+		ret = test_signal_sig(g_sig_to_test[i]);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 /* Run syscall tests between IDs <min> and <max>.
  * Return 0 on success, non-zero on failure.
  */
@@ -494,6 +692,7 @@ int run_syscall(int min, int max)
 		CASE_TEST(dup3_0);            tmp = dup3(0, 100, 0);  EXPECT_SYSNE(1, tmp, -1); close(tmp); break;
 		CASE_TEST(dup3_m1);           tmp = dup3(-1, 100, 0); EXPECT_SYSER(1, tmp, -1, EBADF); if (tmp != -1) close(tmp); break;
 		CASE_TEST(execve_root);       EXPECT_SYSER(1, execve("/", (char*[]){ [0] = "/", [1] = NULL }, NULL), -1, EACCES); break;
+		CASE_TEST(fork);              EXPECT_SYSZR(1, test_fork()); break;
 		CASE_TEST(getdents64_root);   EXPECT_SYSNE(1, test_getdents64("/"), -1); break;
 		CASE_TEST(getdents64_null);   EXPECT_SYSER(1, test_getdents64("/dev/null"), -1, ENOTDIR); break;
 		CASE_TEST(gettimeofday_null); EXPECT_SYSZR(1, gettimeofday(NULL, NULL)); break;
@@ -502,6 +701,7 @@ int run_syscall(int min, int max)
 		CASE_TEST(gettimeofday_bad2); EXPECT_SYSER(1, gettimeofday(NULL, (void *)1), -1, EFAULT); break;
 		CASE_TEST(gettimeofday_bad2); EXPECT_SYSER(1, gettimeofday(NULL, (void *)1), -1, EFAULT); break;
 #endif
+		CASE_TEST(getpagesize);       EXPECT_SYSZR(1, test_getpagesize()); break;
 		CASE_TEST(ioctl_tiocinq);     EXPECT_SYSZR(1, ioctl(0, TIOCINQ, &tmp)); break;
 		CASE_TEST(ioctl_tiocinq);     EXPECT_SYSZR(1, ioctl(0, TIOCINQ, &tmp)); break;
 		CASE_TEST(link_root1);        EXPECT_SYSER(1, link("/", "/"), -1, EEXIST); break;
@@ -521,6 +721,8 @@ int run_syscall(int min, int max)
 		CASE_TEST(select_null);       EXPECT_SYSZR(1, ({ struct timeval tv = { 0 }; select(0, NULL, NULL, NULL, &tv); })); break;
 		CASE_TEST(select_stdout);     EXPECT_SYSNE(1, ({ fd_set fds; FD_ZERO(&fds); FD_SET(1, &fds); select(2, NULL, &fds, NULL, NULL); }), -1); break;
 		CASE_TEST(select_fault);      EXPECT_SYSER(1, select(1, (void *)1, NULL, NULL, 0), -1, EFAULT); break;
+		CASE_TEST(sigaction);         EXPECT_SYSZR(1, test_sigaction()); break;
+		CASE_TEST(signal);            EXPECT_SYSZR(1, test_signal()); break;
 		CASE_TEST(stat_blah);         EXPECT_SYSER(1, stat("/proc/self/blah", &stat_buf), -1, ENOENT); break;
 		CASE_TEST(stat_fault);        EXPECT_SYSER(1, stat(NULL, &stat_buf), -1, EFAULT); break;
 		CASE_TEST(symlink_root);      EXPECT_SYSER(1, symlink("/", "/"), -1, EEXIST); break;
@@ -542,9 +744,7 @@ int run_syscall(int min, int max)
 int run_stdlib(int min, int max)
 {
 	int test;
-	int tmp;
 	int ret = 0;
-	void *p1, *p2;
 
 	for (test = min; test >= 0 && test <= max; test++) {
 		int llen = 0; // line length

@@ -18,6 +18,7 @@
 #include <linux/fs.h>
 #include <linux/loop.h>
 #include <linux/time.h>
+#include <linux/auxvec.h>
 
 #include "arch.h"
 #include "errno.h"
@@ -498,6 +499,26 @@ pid_t gettid(void)
 	return sys_gettid();
 }
 
+static unsigned long getauxval(unsigned long key);
+
+/*
+ * long getpagesize(void);
+ */
+
+static __attribute__((unused))
+long getpagesize(void)
+{
+	long ret;
+
+	ret = getauxval(AT_PAGESZ);
+	if (!ret) {
+		SET_ERRNO(ENOENT);
+		return -1;
+	}
+
+	return ret;
+}
+
 
 /*
  * int gettimeofday(struct timeval *tv, struct timezone *tz);
@@ -686,6 +707,7 @@ int mknod(const char *path, mode_t mode, dev_t dev)
 #define MAP_FAILED ((void *)-1)
 #endif
 
+#ifndef sys_mmap
 static __attribute__((unused))
 void *sys_mmap(void *addr, size_t length, int prot, int flags, int fd,
 	       off_t offset)
@@ -707,6 +729,7 @@ void *sys_mmap(void *addr, size_t length, int prot, int flags, int fd,
 	return (void *)my_syscall6(n, addr, length, prot, flags, fd, offset);
 #endif
 }
+#endif
 
 static __attribute__((unused))
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
@@ -1024,6 +1047,103 @@ pid_t setsid(void)
 	return ret;
 }
 
+typedef void (*sighandler_t)(int sig);
+
+/*
+ * int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact);
+ */
+
+static __attribute__((unused))
+int sys_sigaction(int signum, const struct sigaction *act,
+		  struct sigaction *oldact)
+{
+	return my_syscall4(__NR_rt_sigaction, signum, act, oldact,
+			   sizeof(sigset_t));
+}
+
+__attribute__((weak,unused,noreturn,optimize("omit-frame-pointer"),section(".text.__restore_rt")))
+void __restore_rt(void)
+{
+	my_syscall0(__NR_rt_sigreturn);
+	__builtin_unreachable();
+}
+
+static __attribute__((unused))
+int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
+{
+	struct sigaction act2 = *act;
+	int ret;
+
+	/*
+	 * On Linux x86-64, libc's sigaction() always sets the
+	 * @act->sa_restorer when the caller passes a NULL.
+	 *
+	 * @act->sa_restorer is an arch-specific function used
+	 * as a "signal trampoline".
+	 *
+	 * @act->sa_handler is a signal handler provided by the
+	 * user.
+	 *
+	 * When the handled signal is caught, the %rip jumps to
+	 * @act->sa_handler with user stack already set by the
+	 * kernel as below:
+	 *
+	 *         |--------------------|
+	 * %rsp -> |  act->sa_restorer  | (return address)
+	 *         |--------------------|
+	 *         | struct rt_sigframe | (process context info)
+	 *         |                    |
+	 *         |                    |
+	 *          ....................
+	 *
+	 * Once this signal handler executes the "ret" instruction,
+	 * the %rip jumps to @act->sa_restorer. The sa_restorer
+	 * function has to invoke the __rt_sigreturn syscall with
+	 * %rsp pointing to the `struct rt_sigframe` that the kernel
+	 * constructed previously to resume the process.
+	 *
+	 * `struct rt_sigframe` contains the registers' value before
+	 * the signal is caught.
+	 *
+	 */
+	if (!act2.sa_restorer) {
+		act2.sa_flags |= SA_RESTORER;
+		act2.sa_restorer = __restore_rt;
+	}
+
+	ret = sys_sigaction(signum, &act2, oldact);
+	if (ret < 0) {
+		SET_ERRNO(-ret);
+		ret = -1;
+	}
+	return ret;
+}
+
+/*
+ * sighandler_t signal(int signum, sighandler_t handler);
+ */
+
+static __attribute__((unused))
+sighandler_t signal(int signum, sighandler_t handler)
+{
+	const struct sigaction act = {
+		.sa_handler = handler,
+		.sa_flags = SA_RESTORER,
+		.sa_restorer = __restore_rt
+	};
+	sighandler_t old_sah;
+	struct sigaction old;
+	int ret;
+
+	ret = sys_sigaction(signum, &act, &old);
+	if (ret < 0) {
+		SET_ERRNO(-ret);
+		old_sah = SIG_ERR;
+	} else {
+		old_sah = old.sa_handler;
+	}
+	return old_sah;
+}
 
 /*
  * int stat(const char *path, struct stat *buf);

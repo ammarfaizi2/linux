@@ -174,6 +174,9 @@ struct sys_stat_struct {
 	_arg1;                                                                \
 })
 
+char **environ __attribute__((weak));
+const unsigned long *_auxv __attribute__((weak));
+
 /* startup code */
 __asm__ (".section .text\n"
     ".weak _start\n"
@@ -183,7 +186,8 @@ __asm__ (".section .text\n"
      * 16-bit mode, the assembler cannot know, so we need to tell it we're in
      * 32-bit now, then switch to 16-bit (is there a better way to do it than
      * adding 1 by hand ?) and tell the asm we're now in 16-bit mode so that
-     * it generates correct instructions. Note that we do not support thumb1.
+     * it generates correct instructions. Note that thumb1 is also supported,
+     * as it only slightly increases the instruction count.
      */
     ".code 32\n"
     "add     r0, pc, #1\n"
@@ -192,13 +196,36 @@ __asm__ (".section .text\n"
 #endif
     "pop {%r0}\n"                 // argc was in the stack
     "mov %r1, %sp\n"              // argv = sp
-    "add %r2, %r1, %r0, lsl #2\n" // envp = argv + 4*argc ...
-    "add %r2, %r2, $4\n"          //        ... + 4
-    "and %r3, %r1, $-8\n"         // AAPCS : sp must be 8-byte aligned in the
-    "mov %sp, %r3\n"              //         callee, an bl doesn't push (lr=pc)
+
+    "add %r2, %r0, $1\n"          // envp = (argc + 1) ...
+    "lsl %r2, %r2, $2\n"          //        * 4        ...
+    "add %r2, %r2, %r1\n"         //        + argv
+    "ldr %r3, 1f\n"               // r3 = &environ (see below)
+    "str %r2, [r3]\n"             // store envp into environ
+
+    "mov r4, r2\n"                // search for auxv (follows NULL after last env)
+    "0:\n"
+    "mov r5, r4\n"                // r5 = r4
+    "add r4, r4, #4\n"            // r4 += 4
+    "ldr r5,[r5]\n"               // r5 = *r5 = *(r4-4)
+    "cmp r5, #0\n"                // and stop at NULL after last env
+    "bne 0b\n"
+    "ldr %r3, 2f\n"               // r3 = &_auxv (low bits)
+    "str r4, [r3]\n"              // store r4 into _auxv
+
+    "mov %r3, $8\n"               // AAPCS : sp must be 8-byte aligned in the
+    "neg %r3, %r3\n"              //         callee, and bl doesn't push (lr=pc)
+    "and %r3, %r3, %r1\n"         // so we do sp = r1(=sp) & r3(=-8);
+    "mov %sp, %r3\n"              //
+
     "bl main\n"                   // main() returns the status code, we'll exit with it.
     "movs r7, $1\n"               // NR_exit == 1
     "svc $0x00\n"
+    ".align 2\n"                  // below are the pointers to a few variables
+    "1:\n"
+    ".word environ\n"
+    "2:\n"
+    ".word _auxv\n"
     "");
 
 #endif // _NOLIBC_ARCH_ARM_H
